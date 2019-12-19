@@ -410,6 +410,11 @@ module Args = struct
     info ["f";"force"] ~docs ~doc:
       "Don't stop on opam linting errors"
 
+  let skip_deps_check =
+    value & flag &
+    info ["d"; "skip-deps-check"] ~docs ~doc:
+      "Don't check 'depends' stanza in opam files"
+
   let tag =
     value & opt (some string) None &
     info ["tag"] ~docs ~docv:"TAG" ~doc:
@@ -595,8 +600,88 @@ let to_files ?(split=false) ~packages_dir meta_opams =
     []
   |> List.rev
 
-let main_term root =
-  let run args force tag version dry_run repo target_branch packages_dir title msg split =
+let check_depends_stanza meta_opams opam_root =
+  OpamConsole.note "Checking 'depends' stanza in your opam files \
+                    (bypass with --skip-deps-check)";
+  let config =
+    match OpamStateConfig.load_defaults opam_root with
+    | Some config -> config
+    | None -> failwith "OpamStateConfig.load_defaults"
+  in
+  let switch =
+    match OpamFile.Config.switch config with
+    | Some switch -> switch
+    | None -> failwith "OpamFile.Config.switch"
+  in
+  OpamGlobalState.with_ `Lock_none @@ fun gt ->
+  OpamSwitchState.with_ `Lock_none gt ~switch @@ fun st ->
+  let direct_deps =
+    OpamPackage.Map.fold (fun pkg (_meta, opam_file) acc ->
+      let depends = OpamFile.OPAM.depends opam_file in
+      let env = OpamPackageVar.resolve_switch ~package:pkg st in
+      let formula = OpamFilter.filter_formula env depends in
+      OpamFormula.ors [acc; formula])
+      meta_opams OpamFormula.Empty
+  in
+  let resolved_deps =
+    let direct_pkgs =
+      OpamFormula.packages_of_atoms
+        (OpamPackage.Set.union st.installed st.packages)
+        (OpamFormula.atoms direct_deps)
+    in
+    let transitive_pkgs =
+      let universe =
+        OpamSwitchState.universe st
+          ~requested:(OpamPackage.names_of_packages st.packages)
+          Query
+      in
+      OpamSolver.dependencies ~depopts:false ~build:false ~post:false
+        ~installed:false ~unavailable:false
+        universe direct_pkgs
+      |> OpamPackage.Set.of_list
+    in
+    OpamPackage.Set.union direct_pkgs transitive_pkgs
+  in
+  let missing_direct_deps =
+    OpamFormula.fold_left (fun acc (name, _) ->
+      if not (OpamPackage.Set.exists (fun pkg ->
+        OpamPackage.name pkg = name) resolved_deps)
+      then OpamPackage.Name.to_string name :: acc
+      else acc)
+      [] direct_deps
+  in
+  if missing_direct_deps <> [] then begin
+    OpamConsole.warning
+      "These packages could not be resolved to packages in your current switch:\n\n\
+       %s\n\n\
+       Please double-check the filters and constraints (package names, version strings) \
+       listed in the 'depends' section of your opam-files."
+      (String.concat ", " missing_direct_deps)
+  end;
+  let pinned_deps =
+    OpamPackage.Set.fold (fun pkg acc ->
+      if OpamPackage.Set.mem pkg st.pinned
+      then  pkg :: acc
+      else acc)
+      resolved_deps []
+  in
+  if pinned_deps <> [] then begin
+    let pinned_pkgs_s =
+      List.map OpamPackage.name pinned_deps
+      |> List.map OpamPackage.Name.to_string
+      |> String.concat ", "
+    in
+    OpamConsole.warning
+      "These packages in your current switch are pinned:\n\n\
+       %s\n\n\
+       Your release may not be installable by others."
+      pinned_pkgs_s
+  end;
+  missing_direct_deps, pinned_deps
+
+let main_term ~publish_root:root ~opam_root =
+  let run args force skip_deps_check tag version dry_run repo target_branch
+      packages_dir title msg split =
     let dirs, opams, urls, projects, names =
       List.fold_left (fun (dirs, opams, urls, projects, names) -> function
           | `Dir d -> (dirs @ [d], opams, urls, projects, names)
@@ -610,7 +695,16 @@ let main_term root =
     let meta_opams =
       get_opams force dirs opams urls projects tag names version
     in
-    if not (OpamConsole.confirm
+    let default =
+      if not skip_deps_check then
+        let missing_direct_deps, pinned_pkgs =
+          check_depends_stanza meta_opams opam_root
+        in
+        not (missing_direct_deps <> [] || pinned_pkgs <> [])
+      else
+        true
+    in
+    if not (OpamConsole.confirm ~default
               "\nContinue ? You will be shown the patch before submitting.")
     then OpamStd.Sys.exit_because `Aborted;
     let pr_title, pr_body = pull_request_message ?msg meta_opams in
@@ -625,7 +719,7 @@ let main_term root =
   in
   let open Args in
   Term.(pure run
-        $ src_args $ force $ tag $ version $ dry_run
+        $ src_args $ force $ skip_deps_check $ tag $ version $ dry_run
         $ repo $ target_branch $ packages_dir $ title $ msg_file $ split)
 
 
@@ -688,7 +782,7 @@ let () =
   OpamStateConfig.init ~root_dir:opam_root ();
   let publish_root = OpamFilename.Op.(opam_root / "plugins" / "opam-publish") in
   try
-    match Term.eval ~catch:false (main_term publish_root, main_info) with
+    match Term.eval ~catch:false (main_term ~publish_root ~opam_root, main_info) with
     | `Ok () | `Version | `Help -> OpamStd.Sys.exit_because `Success
     | `Error _ -> OpamStd.Sys.exit_because `Bad_arguments
   with
